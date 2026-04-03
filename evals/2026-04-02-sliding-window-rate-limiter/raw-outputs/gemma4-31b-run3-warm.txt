@@ -1,0 +1,196 @@
+This is a professional, production-ready implementation of a Sliding Window rate limiter. 
+
+The **Sliding Window** algorithm is superior to "Fixed Window" because it prevents traffic bursts at the edge of time boundaries (the "double-limit" problem).
+
+### 1. The Implementation (`rate-limiter.ts`)
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+export interface RateLimitConfig {
+  windowMs: number; // Time window in milliseconds
+  limit: number;    // Max requests per window
+  keyGenerator?: (req: Request) => string;
+}
+
+export interface IStorageAdapter {
+  // Returns { count: number, resetTime: number }
+  incrementAndGetWindow(key: string, windowMs: number): Promise<{ count: number; resetTime: number }>;
+}
+
+/**
+ * In-Memory Storage Adapter (Default)
+ * Uses a sliding window via timestamp arrays
+ */
+export class MemoryStorageAdapter implements IStorageAdapter {
+  private store = new Map<string, number[]>();
+
+  async incrementAndGetWindow(key: string, windowMs: number): Promise<{ count: number; resetTime: number }> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+
+    let timestamps = this.store.get(key) || [];
+    
+    // Filter out timestamps outside the current window (The "Sliding" part)
+    timestamps = timestamps.filter(ts => ts > windowStart);
+    
+    timestamps.push(now);
+    this.store.set(key, timestamps);
+
+    const resetTime = timestamps[0] + windowMs;
+    return { count: timestamps.length, resetTime };
+  }
+}
+
+/**
+ * Redis Storage Adapter for Distributed Deployments
+ * Uses a Redis Sorted Set (ZSET) to maintain the sliding window
+ */
+export class RedisStorageAdapter implements IStorageAdapter {
+  constructor(private redisClient: any) {}
+
+  async incrementAndGetWindow(key: string, windowMs: number): Promise<{ count: number; resetTime: number }> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    const redisKey = `rl:${key}`;
+
+    const multi = this.redisClient.multi();
+    // Remove old entries
+    multi.zremrangebyscore(redisKey, 0, windowStart);
+    // Add current request
+    multi.zadd(redisKey, now, now.toString());
+    // Count entries in window
+    multi.zcard(redisKey);
+    // Get oldest entry to calculate reset
+    multi.zrange(redisKey, 0, 0);
+    // Set expiry on the set to clean up inactive keys
+    multi.expire(redisKey, Math.ceil(windowMs / 1000));
+
+    const results = await multi.exec();
+    const count = results[2] as number;
+    const oldest = results[3] as string[];
+    const resetTime = oldest.length > 0 ? parseInt(oldest[0]) + windowMs : now + windowMs;
+
+    return { count, resetTime };
+  }
+}
+
+/**
+ * The Middleware Factory
+ */
+export const rateLimiter = (
+  config: RateLimitConfig, 
+  storage: IStorageAdapter = new MemoryStorageAdapter()
+) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const key = config.keyGenerator ? config.keyGenerator(req) : req.ip;
+    
+    try {
+      const { count, resetTime } = await storage.incrementAndGetWindow(key, config.windowMs);
+      const retryAfter = Math.ceil((resetTime - Date.now()) / 1000);
+
+      // Standard Rate Limit Headers
+      res.setHeader('X-RateLimit-Limit', config.limit);
+      res.setHeader('X-RateLimit-Remaining', Math.max(0, config.limit - count));
+      res.setHeader('X-RateLimit-Reset', Math.ceil(resetTime / 1000));
+
+      if (count > config.limit) {
+        res.setHeader('Retry-After', retryAfter);
+        return res.status(429).json({
+          error: 'Too Many Requests',
+          message: `Rate limit exceeded. Try again in ${retryAfter} seconds.`,
+        });
+      }
+
+      next();
+    } catch (err) {
+      // In production, we usually let requests through if the limiter fails (fail-open)
+      console.error('RateLimiter Error:', err);
+      next();
+    }
+  };
+};
+```
+
+---
+
+### 2. Usage Example (`app.ts`)
+
+```typescript
+import express from 'express';
+import { rateLimiter, RedisStorageAdapter, MemoryStorageAdapter } from './rate-limiter';
+import Redis from 'ioredis';
+
+const app = express();
+const redis = new Redis(); // Connects to localhost:6379
+const redisStore = new RedisStorageAdapter(redis);
+const memStore = new MemoryStorageAdapter();
+
+// Global limit: 100 requests per 15 minutes
+app.use(rateLimiter({ 
+  windowMs: 15 * 60 * 1000, 
+  limit: 100 
+}));
+
+// Per-route limit: 5 requests per minute (Strict)
+app.get('/api/sensitive-data', 
+  rateLimiter({ 
+    windowMs: 60 * 1000, 
+    limit: 5,
+    keyGenerator: (req) => req.headers['x-api-key'] as string || req.ip 
+  }, redisStore), // Using Redis for distributed scaling
+  (req, res) => res.send('Sensitive Data')
+);
+
+app.listen(3000);
+```
+
+---
+
+### 3. Unit Tests (`rate-limiter.test.ts`)
+Using Jest.
+
+```typescript
+import { rateLimiter, MemoryStorageAdapter } from './rate-limiter';
+import { Request, Response } from 'express';
+
+describe('Rate Limiter Middleware', () => {
+  let mockRequest: Partial<Request>;
+  let mockResponse: Partial<Response>;
+  let nextFunction: jest.Mock;
+
+  beforeEach(() => {
+    mockRequest = { ip: '127.0.0.1', headers: {} };
+    mockResponse = {
+      setHeader: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+    nextFunction = jest.fn();
+  });
+
+  it('should allow requests under the limit', async () => {
+    const middleware = rateLimiter({ windowMs: 60000, limit: 2 });
+    
+    await middleware(mockRequest as Request, mockResponse as Response, nextFunction);
+    await middleware(mockRequest as Request, mockResponse as Response, nextFunction);
+    
+    expect(nextFunction).toHaveBeenCalledTimes(2);
+  });
+
+  it('should block requests exceeding the limit', async () => {
+    const middleware = rateLimiter({ windowMs: 60000, limit: 1 });
+    
+    await middleware(mockRequest as Request, mockResponse as Response, nextFunction);
+    await middleware(mockRequest as Request, mockResponse as Response, nextFunction);
+    
+    expect(nextFunction).toHaveBeenCalledTimes(1);
+    expect(mockResponse.status).toHaveBeenCalledWith(429);
+    expect(mockResponse.setHeader).toHaveBeenCalledWith('Retry-After', expect.any(Number));
+  });
+
+  it('should handle different keys independently', async () => {
+    const middleware = rateLimiter({ windowMs: 60000, limit: 1 });
+    
+    const req1 = { ...mockRequest, ip: '1.1.1
+ELAPSED_MS:255590

@@ -1,0 +1,249 @@
+This is a classic systems design problem. To implement a **Sliding Window** algorithm, we cannot simply increment a counter (as in Fixed Window); we must track the timestamps of individual requests or use a sorted set to count requests within the last $N$ seconds.
+
+### Strategy & Architecture
+
+#### 1. The Algorithm: Sliding Window Log
+I will implement the **Sliding Window Log** approach. 
+- For every request, we store a timestamp in a list/set associated with the user's key.
+- We remove all timestamps older than the current window (e.g., `now - 60s`).
+- If the count of remaining timestamps is less than the limit, the request is allowed.
+- This prevents the "burst" problem at window boundaries common in Fixed Window algorithms.
+
+#### 2. Architecture Components
+- **`RateLimitStore` (Interface):** An abstraction layer. This allows the middleware to not care if it's talking to a local Map or a Redis cluster.
+- **`MemoryStore`:** A production-grade in-memory implementation using a Map of arrays.
+- **`RedisStore`:** An implementation using Redis `ZSET` (Sorted Sets). `ZREMRANGEBYSCORE` is used to slide the window, and `ZCARD` to count.
+- **`RateLimiter` (Middleware Factory):** A class that consumes the store and a configuration map to generate Express middleware.
+
+#### 3. Complexity Analysis
+- **Time Complexity:** $O(N)$ for Memory (where $N$ is requests in window), $O(\log N)$ for Redis.
+- **Space Complexity:** $O(U \times R)$ where $U$ is unique users and $R$ is requests per window.
+
+---
+
+### Implementation
+
+#### 1. Types and Interfaces (`types.ts`)
+
+```typescript
+export interface RateLimitConfig {
+  windowMs: number;
+  limit: number;
+}
+
+export interface RateLimitResult {
+  allowed: boolean;
+  current: number;
+  limit: number;
+  reset: number; // Timestamp in ms
+}
+
+export interface IRateLimitStore {
+  increment: (key: string, windowMs: number, limit: number) => Promise<RateLimitResult>;
+}
+```
+
+#### 2. Storage Implementations (`stores.ts`)
+
+```typescript
+import { IRateLimitStore, RateLimitResult } from './types';
+import Redis from 'ioredis';
+
+// Default In-Memory Store
+export class MemoryStore implements IRateLimitStore {
+  private storage = new Map<string, number[]>();
+
+  async increment(key: string, windowMs: number, limit: number): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    
+    let timestamps = this.storage.get(key) || [];
+    
+    // Slide window: Filter out old timestamps
+    timestamps = timestamps.filter(ts => ts > windowStart);
+    
+    const current = timestamps.length;
+    const allowed = current < limit;
+
+    if (allowed) {
+      timestamps.push(now);
+    }
+
+    this.storage.set(key, timestamps);
+
+    return {
+      allowed,
+      current: current + 1,
+      limit,
+      reset: Math.max(0, timestamps[0] + windowMs) // Earliest timestamp to expire
+    };
+  }
+}
+
+// Pluggable Redis Store
+export class RedisStore implements IRateLimitStore {
+  constructor(private redis: Redis) {}
+
+  async increment(key: string, windowMs: number, limit: number): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    const redisKey = `ratelimit:${key}`;
+
+    // Use Redis Pipeline for atomicity and performance
+    const pipeline = this.redis.pipeline();
+    
+    // 1. Remove expired timestamps
+    pipeline.zremrangebyscore(redisKey, 0, windowStart);
+    // 2. Count remaining
+    pipeline.zcard(redisKey);
+    // 3. Add current request (if we assume it's allowed, we'll fix it in logic)
+    pipeline.zadd(redisKey, now, now.toString());
+    // 4. Set expiry on the set to clean up idle keys
+    pipeline.pexpire(redisKey, windowMs);
+
+    const results = await pipeline.exec();
+    const current = (results[1][1] as number) + 1;
+    const allowed = current <= limit;
+
+    // If not allowed, remove the timestamp we just added to avoid penalizing the user
+    if (!allowed) {
+      await this.redis.zrem(redisKey, now.toString());
+    }
+
+    // Get the oldest timestamp to calculate reset
+    const oldest = await this.redis.zrange(redisKey, 0, 0, 'WITHSCORES');
+    const reset = oldest.length ? parseInt(oldest[1]) + windowMs : now + windowMs;
+
+    return { allowed, current, limit, reset };
+  }
+}
+```
+
+#### 3. The Middleware (`middleware.ts`)
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { IRateLimitStore, RateLimitConfig } from './types';
+
+export class RateLimiter {
+  constructor(
+    private store: IRateLimitStore,
+    private routeConfigs: Record<string, RateLimitConfig>
+  ) {}
+
+  createMiddleware() {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      const path = req.route?.path || req.path;
+      const config = this.routeConfigs[path];
+
+      if (!config) return next(); // No limit for this route
+
+      // Unique key: IP + Path (could be UserID if authenticated)
+      const key = `${req.ip}:${path}`;
+      
+      try {
+        const { allowed, current, limit, reset } = await this.store.increment(
+          key, 
+          config.windowMs, 
+          config.limit
+        );
+
+        const retryAfter = Math.ceil((reset - Date.now()) / 1000);
+
+        res.set('X-RateLimit-Limit', limit.toString());
+        res.set('X-RateLimit-Remaining', Math.max(0, limit - current).toString());
+        res.set('X-RateLimit-Reset', Math.ceil(reset / 1000).toString());
+
+        if (!allowed) {
+          res.set('Retry-After', retryAfter.toString());
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            retryAfterSeconds: retryAfter
+          });
+        }
+
+        next();
+      } catch (err) {
+        // Fail open: if rate limiter fails, allow request but log error
+        console.error('Rate Limiter Error:', err);
+        next();
+      }
+    };
+  }
+}
+```
+
+---
+
+### Unit Tests (`test.ts`)
+Using Jest for testing.
+
+```typescript
+import { MemoryStore } from './stores';
+import { RateLimiter } from './middleware';
+import { Request, Response } from 'express';
+
+describe('Rate Limiter Core Logic', () => {
+  it('should allow requests under the limit', async () => {
+    const store = new MemoryStore();
+    const result = await store.increment('user1', 60000, 2);
+    expect(result.allowed).toBe(true);
+    expect(result.current).toBe(1);
+  });
+
+  it('should block requests exceeding the limit', async () => {
+    const store = new MemoryStore();
+    await store.increment('user1', 60000, 1);
+    const result = await store.increment('user1', 60000, 1);
+    expect(result.allowed).toBe(false);
+  });
+
+  it('should slide the window and allow requests after time passes', async () => {
+    jest.useFakeTimers();
+    const store = new MemoryStore();
+    
+    await store.increment('user1', 1000, 1);
+    let result = await store.increment('user1', 1000, 1);
+    expect(result.allowed).toBe(false);
+
+    jest.advanceTimersByTime(1100);
+    
+    result = await store.increment('user1', 1000, 1);
+    expect(result.allowed).toBe(true);
+    jest.useRealTimers();
+  });
+});
+```
+
+### Production Usage Example
+
+```typescript
+import express from 'express';
+import { RateLimiter } from './middleware';
+import { MemoryStore, RedisStore } from './stores';
+import Redis from 'ioredis';
+
+const app = express();
+const redis = new Redis();
+
+const limiter = new RateLimiter(
+  new RedisStore(redis), // Switch to MemoryStore() for local dev
+  {
+    '/api/login': { windowMs: 60 * 1000, limit: 5 },
+    '/api/search': { windowMs: 60 * 1000, limit: 60 },
+  }
+);
+
+app.use(limiter.createMiddleware());
+
+app.post('/api/login', (req, res) => res.send('Logged in'));
+app.get('/api/search', (req, res) => res.send('Search results'));
+
+app.listen(3000);
+```
+
+### Key Production Considerations implemented:
+1.  **Fail-Open Strategy:** The middleware wraps the store call in a `try-catch`. If Redis goes down, the API remains available (better to allow a few extra requests than to crash the entire site).
+2.  **Atomic Redis Operations:** Used `pipeline` to minimize network round-trips and ensure the window slide and count happen in one batch.
+3.  **Memory Leak Prevention:** In `MemoryStore`, I filter the array on every request. In `RedisStore`, I use `pexpire` so that inactive users' data is automatically purged.
+4.  **Standard Compliance:** Implemented `Retry-After` and `X-RateLimit` headers as per industry standards.

@@ -1,0 +1,402 @@
+# Production-Ready Rate Limiter for Express.js
+
+## Strategy and Architecture
+
+### Overview
+I'll build a flexible, production-ready rate limiter with a clean separation of concerns:
+
+1. **Storage Layer**: Abstract interface with in-memory and Redis implementations
+2. **Algorithm Layer**: Sliding window log algorithm for accurate rate limiting
+3. **Middleware Layer**: Express middleware with route-specific configuration
+4. **Configuration Layer**: Type-safe configuration management
+
+### Architecture Decisions
+
+1. **Sliding Window Log Algorithm**: 
+   - More accurate than fixed windows
+   - Prevents burst traffic at window boundaries
+   - Stores timestamps of requests within the window
+
+2. **Storage Abstraction**:
+   - Interface-based design for easy swapping
+   - In-memory using Map with automatic cleanup
+   - Redis adapter for distributed systems
+
+3. **Key Design**:
+   - Composite key: `${identifier}:${route}` for per-route limits
+   - Identifier can be IP, user ID, API key, etc.
+
+4. **Headers**:
+   - `X-RateLimit-Limit`: Maximum requests allowed
+   - `X-RateLimit-Remaining`: Requests remaining
+   - `X-RateLimit-Reset`: Window reset timestamp
+   - `Retry-After`: Seconds until retry (on 429)
+
+Let me provide the complete implementation:
+
+## Complete Implementation
+
+### 1. Types and Interfaces
+
+```typescript
+// src/types.ts
+
+export interface RateLimitConfig {
+  windowMs: number; // Time window in milliseconds
+  maxRequests: number; // Maximum requests per window
+}
+
+export interface RouteConfig {
+  [route: string]: RateLimitConfig;
+}
+
+export interface RateLimiterOptions {
+  defaultLimit?: RateLimitConfig;
+  routes?: RouteConfig;
+  keyGenerator?: (req: any) => string;
+  storage?: StorageAdapter;
+  skip?: (req: any) => boolean;
+  onLimitReached?: (req: any, res: any) => void;
+}
+
+export interface RequestLog {
+  timestamps: number[];
+}
+
+export interface StorageAdapter {
+  get(key: string): Promise<RequestLog | null>;
+  set(key: string, value: RequestLog, ttl: number): Promise<void>;
+  delete(key: string): Promise<void>;
+  cleanup?(): Promise<void>;
+}
+
+export interface RateLimitInfo {
+  limit: number;
+  remaining: number;
+  reset: number;
+  retryAfter?: number;
+}
+```
+
+### 2. Storage Adapters
+
+```typescript
+// src/storage/memory-storage.ts
+
+import { StorageAdapter, RequestLog } from '../types';
+
+export class MemoryStorage implements StorageAdapter {
+  private store: Map<string, { data: RequestLog; expiry: number }>;
+  private cleanupInterval: NodeJS.Timeout | null;
+
+  constructor(cleanupIntervalMs: number = 60000) {
+    this.store = new Map();
+    
+    // Periodic cleanup to prevent memory leaks
+    this.cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, cleanupIntervalMs);
+  }
+
+  async get(key: string): Promise<RequestLog | null> {
+    const entry = this.store.get(key);
+    
+    if (!entry) {
+      return null;
+    }
+
+    // Check if expired
+    if (Date.now() > entry.expiry) {
+      this.store.delete(key);
+      return null;
+    }
+
+    return entry.data;
+  }
+
+  async set(key: string, value: RequestLog, ttl: number): Promise<void> {
+    this.store.set(key, {
+      data: value,
+      expiry: Date.now() + ttl,
+    });
+  }
+
+  async delete(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
+  async cleanup(): Promise<void> {
+    const now = Date.now();
+    const keysToDelete: string[] = [];
+
+    for (const [key, entry] of this.store.entries()) {
+      if (now > entry.expiry) {
+        keysToDelete.push(key);
+      }
+    }
+
+    keysToDelete.forEach(key => this.store.delete(key));
+  }
+
+  // For testing purposes
+  clear(): void {
+    this.store.clear();
+  }
+
+  // Cleanup on shutdown
+  destroy(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.store.clear();
+  }
+
+  // Get current store size (for monitoring)
+  size(): number {
+    return this.store.size;
+  }
+}
+```
+
+```typescript
+// src/storage/redis-storage.ts
+
+import { StorageAdapter, RequestLog } from '../types';
+import { Redis } from 'ioredis';
+
+export class RedisStorage implements StorageAdapter {
+  private client: Redis;
+  private keyPrefix: string;
+
+  constructor(client: Redis, keyPrefix: string = 'ratelimit:') {
+    this.client = client;
+    this.keyPrefix = keyPrefix;
+  }
+
+  private getKey(key: string): string {
+    return `${this.keyPrefix}${key}`;
+  }
+
+  async get(key: string): Promise<RequestLog | null> {
+    try {
+      const data = await this.client.get(this.getKey(key));
+      
+      if (!data) {
+        return null;
+      }
+
+      return JSON.parse(data) as RequestLog;
+    } catch (error) {
+      console.error('Redis get error:', error);
+      return null;
+    }
+  }
+
+  async set(key: string, value: RequestLog, ttl: number): Promise<void> {
+    try {
+      const redisKey = this.getKey(key);
+      await this.client.setex(
+        redisKey,
+        Math.ceil(ttl / 1000), // Convert ms to seconds
+        JSON.stringify(value)
+      );
+    } catch (error) {
+      console.error('Redis set error:', error);
+      throw error;
+    }
+  }
+
+  async delete(key: string): Promise<void> {
+    try {
+      await this.client.del(this.getKey(key));
+    } catch (error) {
+      console.error('Redis delete error:', error);
+    }
+  }
+
+  // Optional: Cleanup expired keys (Redis handles this automatically, but this can force it)
+  async cleanup(): Promise<void> {
+    // Redis automatically handles expiration, so this is a no-op
+    // Could implement scanning and cleanup if needed
+  }
+
+  async disconnect(): Promise<void> {
+    await this.client.quit();
+  }
+}
+```
+
+### 3. Core Rate Limiter Algorithm
+
+```typescript
+// src/rate-limiter.ts
+
+import {
+  RateLimitConfig,
+  StorageAdapter,
+  RequestLog,
+  RateLimitInfo,
+} from './types';
+
+export class RateLimiter {
+  private storage: StorageAdapter;
+
+  constructor(storage: StorageAdapter) {
+    this.storage = storage;
+  }
+
+  /**
+   * Check if a request should be allowed based on sliding window algorithm
+   */
+  async checkLimit(
+    key: string,
+    config: RateLimitConfig
+  ): Promise<RateLimitInfo> {
+    const now = Date.now();
+    const windowStart = now - config.windowMs;
+
+    // Get existing request log
+    let requestLog = await this.storage.get(key);
+
+    if (!requestLog) {
+      requestLog = { timestamps: [] };
+    }
+
+    // Remove timestamps outside the current window (sliding window)
+    requestLog.timestamps = requestLog.timestamps.filter(
+      timestamp => timestamp > windowStart
+    );
+
+    const requestCount = requestLog.timestamps.length;
+    const isAllowed = requestCount < config.maxRequests;
+
+    // If allowed, add current timestamp
+    if (isAllowed) {
+      requestLog.timestamps.push(now);
+      await this.storage.set(key, requestLog, config.windowMs);
+    }
+
+    // Calculate when the oldest request will expire
+    const oldestTimestamp = requestLog.timestamps[0] || now;
+    const resetTime = oldestTimestamp + config.windowMs;
+
+    const info: RateLimitInfo = {
+      limit: config.maxRequests,
+      remaining: Math.max(0, config.maxRequests - requestCount - (isAllowed ? 1 : 0)),
+      reset: Math.ceil(resetTime / 1000), // Unix timestamp in seconds
+    };
+
+    // If limit exceeded, calculate retry after
+    if (!isAllowed && requestLog.timestamps.length > 0) {
+      info.retryAfter = Math.ceil((resetTime - now) / 1000);
+    }
+
+    return info;
+  }
+
+  /**
+   * Reset the rate limit for a specific key
+   */
+  async reset(key: string): Promise<void> {
+    await this.storage.delete(key);
+  }
+}
+```
+
+### 4. Express Middleware
+
+```typescript
+// src/middleware.ts
+
+import { Request, Response, NextFunction } from 'express';
+import { RateLimiter } from './rate-limiter';
+import { MemoryStorage } from './storage/memory-storage';
+import {
+  RateLimiterOptions,
+  RateLimitConfig,
+  RateLimitInfo,
+} from './types';
+
+const DEFAULT_CONFIG: RateLimitConfig = {
+  windowMs: 60 * 1000, // 1 minute
+  maxRequests: 60, // 60 requests per minute
+};
+
+export function createRateLimiter(options: RateLimiterOptions = {}) {
+  const {
+    defaultLimit = DEFAULT_CONFIG,
+    routes = {},
+    keyGenerator = defaultKeyGenerator,
+    storage = new MemoryStorage(),
+    skip,
+    onLimitReached,
+  } = options;
+
+  const rateLimiter = new RateLimiter(storage);
+
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      // Skip rate limiting if skip function returns true
+      if (skip && skip(req)) {
+        return next();
+      }
+
+      // Get identifier for this request
+      const identifier = keyGenerator(req);
+
+      // Get route-specific config or use default
+      const route = req.path;
+      const config = getConfigForRoute(route, routes, defaultLimit);
+
+      // Create unique key for this identifier and route
+      const key = `${identifier}:${route}`;
+
+      // Check rate limit
+      const info: RateLimitInfo = await rateLimiter.checkLimit(key, config);
+
+      // Set rate limit headers
+      setRateLimitHeaders(res, info);
+
+      // If limit exceeded, return 429
+      if (info.remaining < 0 || info.retryAfter) {
+        res.status(429);
+
+        if (info.retryAfter) {
+          res.set('Retry-After', info.retryAfter.toString());
+        }
+
+        // Call custom handler if provided
+        if (onLimitReached) {
+          onLimitReached(req, res);
+        }
+
+        return res.json({
+          error: 'Too many requests',
+          message: `Rate limit exceeded. Try again in ${info.retryAfter} seconds.`,
+          retryAfter: info.retryAfter,
+        });
+      }
+
+      next();
+    } catch (error) {
+      console.error('Rate limiter error:', error);
+      // In case of error, allow the request through (fail open)
+      // In production, you might want to fail closed depending on security requirements
+      next();
+    }
+  };
+}
+
+/**
+ * Default key generator uses IP address
+ */
+function defaultKeyGenerator(req: Request): string {
+  // Try to get real IP from common proxy headers
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  
+  const realIp = req.headers['x-real-ip'];
+  if (typeof realIp === 'string

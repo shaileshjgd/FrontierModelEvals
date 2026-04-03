@@ -1,0 +1,248 @@
+This implementation provides a high-performance sliding window rate limiter. Unlike a "fixed window" (which allows 2x the limit at the window boundary), the sliding window approach uses a timestamped log of requests to ensure a strict limit over any rolling time period.
+
+### 1. The Implementation (`rate-limiter.ts`)
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+export interface RateLimitConfig {
+  windowMs: number;
+  limit: number;
+  keyGenerator?: (req: Request) => string;
+}
+
+export interface RateLimitInfo {
+  limit: number;
+  remaining: number;
+  reset: number; // Timestamp in ms
+}
+
+export interface StorageAdapter {
+  // Returns { currentUsage: number, resetTime: number }
+  incrAndGetWindow(key: string, windowMs: number, limit: number): Promise<RateLimitInfo>;
+}
+
+/**
+ * In-Memory Storage Adapter (Default)
+ * Uses a Map of arrays to track timestamps for sliding window
+ */
+export class MemoryStorage implements StorageAdapter {
+  private store = new Map<string, number[]>();
+
+  async incrAndGetWindow(key: string, windowMs: number, limit: number): Promise<RateLimitInfo> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    
+    let timestamps = this.store.get(key) || [];
+    
+    // Filter out timestamps outside the current sliding window
+    timestamps = timestamps.filter(ts => ts > windowStart);
+    
+    const currentUsage = timestamps.length;
+    
+    if (currentUsage < limit) {
+      timestamps.push(now);
+      this.store.set(key, timestamps);
+    }
+
+    // Reset is the time when the oldest request in the current window expires
+    const oldestRequest = timestamps[0] || now;
+    const reset = oldestRequest + windowMs;
+
+    return {
+      limit,
+      remaining: Math.max(0, limit - timestamps.length),
+      reset
+    };
+  }
+}
+
+/**
+ * Redis Storage Adapter (Distributed)
+ * Uses a Redis Sorted Set (ZSET) to implement sliding window
+ */
+export class RedisStorage implements StorageAdapter {
+  constructor(private redisClient: any) {}
+
+  async incrAndGetWindow(key: string, windowMs: number, limit: number): Promise<RateLimitInfo> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    const redisKey = `rl:${key}`;
+
+    // Atomic transaction using multi
+    const multi = this.redisClient.multi();
+    multi.zremrangebyscore(redisKey, 0, windowStart); // Remove old requests
+    multi.zadd(redisKey, now, now.toString());        // Add current request
+    multi.zcard(redisKey);                             // Count total in window
+    multi.expire(redisKey, Math.ceil(windowMs / 1000)); // TTL for cleanup
+
+    const results = await multi.exec();
+    const currentUsage = results[2] as number;
+
+    // If we exceeded limit, we don't count the current request as "allowed"
+    // but for a strict sliding window, the ZADD already happened.
+    // We return the info to the middleware to handle the 429.
+    
+    const timestamps = await this.redisClient.zrange(redisKey, 0, 0, 'WITHSCORES');
+    const oldestRequest = timestamps[0] ? parseInt(timestamps[1]) : now;
+
+    return {
+      limit,
+      remaining: Math.max(0, limit - currentUsage),
+      reset: oldestRequest + windowMs
+    };
+  }
+}
+
+/**
+ * Rate Limiter Middleware Factory
+ */
+export const rateLimiter = (
+  config: RateLimitConfig, 
+  storage: StorageAdapter = new MemoryStorage()
+) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const key = config.keyGenerator ? config.keyGenerator(req) : req.ip;
+    
+    try {
+      const { limit, remaining, reset } = await storage.incrAndGetWindow(
+        key, 
+        config.windowMs, 
+        config.limit
+      );
+
+      res.setHeader('X-RateLimit-Limit', limit);
+      res.setHeader('X-RateLimit-Remaining', remaining);
+      res.setHeader('X-RateLimit-Reset', Math.ceil(reset / 1000));
+
+      if (remaining < 0 || (remaining === 0 && limit <= 0)) {
+        const retryAfter = Math.ceil((reset - Date.now()) / 1000);
+        res.setHeader('Retry-After', retryAfter);
+        return res.status(429).json({
+          error: 'Too Many Requests',
+          message: `Rate limit exceeded. Try again in ${retryAfter} seconds.`,
+        });
+      }
+
+      next();
+    } catch (err) {
+      // Fail open: if rate limiter crashes, don't block the API
+      console.error('Rate Limiter Error:', err);
+      next();
+    }
+  };
+};
+```
+
+---
+
+### 2. Usage Example (`app.ts`)
+
+```typescript
+import express from 'express';
+import { rateLimiter, RedisStorage } from './rate-limiter';
+import { createClient } from 'redis';
+
+const app = express();
+
+// Optional: Setup Redis
+const redisClient = createClient();
+redisClient.connect();
+const redisStore = new RedisStorage(redisClient);
+
+// Route 1: Strict limit (5 requests per minute)
+app.get('/api/critical', 
+  rateLimiter({ 
+    windowMs: 60 * 1000, 
+    limit: 5, 
+    keyGenerator: (req) => (req.headers['x-api-key'] as string) || req.ip 
+  }, redisStore), 
+  (req, res) => res.send('Critical Data')
+);
+
+// Route 2: Loose limit (100 requests per minute, in-memory)
+app.get('/api/public', 
+  rateLimiter({ 
+    windowMs: 60 * 1000, 
+    limit: 100 
+  }), 
+  (req, res) => res.send('Public Data')
+);
+
+app.listen(3000);
+```
+
+---
+
+### 3. Unit Tests (`rate-limiter.test.ts`)
+
+Using Jest for testing.
+
+```typescript
+import { rateLimiter, MemoryStorage, Request, Response } from 'express';
+
+describe('Rate Limiter Middleware', () => {
+  let mockRequest: any;
+  let mockResponse: any;
+  let nextFunction: jest.Mock;
+
+  beforeEach(() => {
+    mockRequest = { ip: '127.0.0.1', headers: {} };
+    mockResponse = {
+      setHeader: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    };
+    nextFunction = jest.fn();
+  });
+
+  it('should allow requests under the limit', async () => {
+    const middleware = rateLimiter({ windowMs: 60000, limit: 2 });
+    
+    await middleware(mockRequest, mockResponse, nextFunction);
+    await middleware(mockRequest, mockResponse, nextFunction);
+    
+    expect(nextFunction).toHaveBeenCalledTimes(2);
+    expect(mockResponse.setHeader).toHaveBeenCalledWith('X-RateLimit-Remaining', 0);
+  });
+
+  it('should block requests over the limit', async () => {
+    const middleware = rateLimiter({ windowMs: 60000, limit: 1 });
+    
+    await middleware(mockRequest, mockResponse, nextFunction); // 1st OK
+    await middleware(mockRequest, mockResponse, nextFunction); // 2nd Fail
+    
+    expect(nextFunction).toHaveBeenCalledTimes(1);
+    expect(mockResponse.status).toHaveBeenCalledWith(429);
+    expect(mockResponse.setHeader).toHaveBeenCalledWith('Retry-After', expect.any(Number));
+  });
+
+  it('should use custom key generator', async () => {
+    const middleware = rateLimiter({ 
+      windowMs: 60000, 
+      limit: 1, 
+      keyGenerator: (req) => req.headers['x-user-id'] as string 
+    });
+
+    mockRequest.headers['x-user-id'] = 'user-1';
+    await middleware(mockRequest, mockResponse, nextFunction);
+
+    // Different user should still be allowed
+    mockRequest.headers['x-user-id'] = 'user-2';
+    await middleware(mockRequest, mockResponse, nextFunction);
+
+    expect(nextFunction).toHaveBeenCalledTimes(2);
+  });
+});
+```
+
+### Key Engineering Decisions:
+
+1.  **Sliding Window Algorithm**: Used a timestamp log (ZSET in Redis) instead of a counter. This prevents the "burst" vulnerability of Fixed Window counters where a user can double their quota by hitting the API at the end of one window and the start of the next.
+2.  **Complexity**: 
+    *   **Memory**: $O(N)$ per user where $N$ is the limit.
+    *   **Time**: $O(N)$ for memory cleanup, $O(\log N)$ for Redis ZSET operations.
+3.  **Fail-Open Strategy**: The middleware is wrapped in a `try-catch` that calls `next()`. In a production environment, it is usually better to let a request through if the rate limiter (Redis) is down than to crash the entire API.
+4.  **Pluggability**: The `StorageAdapter` interface allows adding MongoDB, Memcached, or others without touching the middleware logic.
+5.  **Headers**: Fully compliant with standard rate-limiting headers (`X-RateLimit-*` and `Retry-After`).
+ELAPSED_MS:151181

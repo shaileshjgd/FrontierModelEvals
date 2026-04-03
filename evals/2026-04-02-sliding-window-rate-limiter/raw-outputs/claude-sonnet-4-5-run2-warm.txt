@@ -1,0 +1,404 @@
+# Production-Ready Sliding Window Rate Limiter for Express.js
+
+I'll create a comprehensive rate limiter with all the requested features.
+
+## Project Structure
+
+```
+rate-limiter/
+├── src/
+│   ├── index.ts
+│   ├── middleware.ts
+│   ├── stores/
+│   │   ├── Store.ts
+│   │   ├── MemoryStore.ts
+│   │   └── RedisStore.ts
+│   ├── types.ts
+│   └── utils.ts
+├── tests/
+│   ├── middleware.test.ts
+│   ├── MemoryStore.test.ts
+│   └── RedisStore.test.ts
+├── package.json
+└── tsconfig.json
+```
+
+## Implementation
+
+### `package.json`
+
+```json
+{
+  "name": "express-sliding-window-rate-limiter",
+  "version": "1.0.0",
+  "description": "Production-ready sliding window rate limiter for Express.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": [
+    "express",
+    "rate-limiter",
+    "middleware",
+    "sliding-window"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.6",
+    "@types/redis": "^4.0.11",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "redis": "^4.6.12"
+  }
+}
+```
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}
+```
+
+### `src/types.ts`
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+export interface RateLimitInfo {
+  limit: number;
+  current: number;
+  remaining: number;
+  resetTime: Date;
+}
+
+export interface RateLimitOptions {
+  windowMs: number;
+  max: number;
+  message?: string | ((req: Request, res: Response) => string);
+  statusCode?: number;
+  keyGenerator?: (req: Request) => string;
+  skip?: (req: Request) => boolean | Promise<boolean>;
+  handler?: (req: Request, res: Response, next: NextFunction) => void;
+  onLimitReached?: (req: Request, res: Response, options: RateLimitInfo) => void;
+  store?: Store;
+  standardHeaders?: boolean;
+  legacyHeaders?: boolean;
+}
+
+export interface Store {
+  /**
+   * Increment the hit count for a key
+   * @param key - The identifier for the client
+   * @returns Promise with rate limit info
+   */
+  increment(key: string): Promise<RateLimitInfo>;
+
+  /**
+   * Reset the hit count for a key
+   * @param key - The identifier for the client
+   */
+  resetKey(key: string): Promise<void>;
+
+  /**
+   * Get the current rate limit info for a key
+   * @param key - The identifier for the client
+   */
+  get(key: string): Promise<RateLimitInfo | undefined>;
+
+  /**
+   * Clean up expired entries
+   */
+  cleanup?(): Promise<void>;
+
+  /**
+   * Reset all keys (primarily for testing)
+   */
+  resetAll?(): Promise<void>;
+}
+
+export interface WindowEntry {
+  count: number;
+  resetTime: number;
+  requests: number[];
+}
+```
+
+### `src/stores/Store.ts`
+
+```typescript
+import { Store } from '../types';
+
+export abstract class BaseStore implements Store {
+  abstract increment(key: string): Promise<any>;
+  abstract resetKey(key: string): Promise<void>;
+  abstract get(key: string): Promise<any>;
+  abstract cleanup?(): Promise<void>;
+  abstract resetAll?(): Promise<void>;
+}
+```
+
+### `src/stores/MemoryStore.ts`
+
+```typescript
+import { Store, RateLimitInfo, WindowEntry } from '../types';
+
+export class MemoryStore implements Store {
+  private store: Map<string, WindowEntry>;
+  private windowMs: number;
+  private max: number;
+  private cleanupInterval?: NodeJS.Timeout;
+
+  constructor(windowMs: number, max: number) {
+    this.store = new Map();
+    this.windowMs = windowMs;
+    this.max = max;
+
+    // Auto cleanup every minute
+    this.startCleanup();
+  }
+
+  private startCleanup(): void {
+    this.cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, 60000); // Run cleanup every minute
+
+    // Don't prevent the process from exiting
+    if (this.cleanupInterval.unref) {
+      this.cleanupInterval.unref();
+    }
+  }
+
+  async increment(key: string): Promise<RateLimitInfo> {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    
+    let entry = this.store.get(key);
+
+    if (!entry || entry.resetTime <= now) {
+      // Create new window
+      entry = {
+        count: 0,
+        resetTime: now + this.windowMs,
+        requests: []
+      };
+      this.store.set(key, entry);
+    }
+
+    // Remove requests outside the sliding window
+    entry.requests = entry.requests.filter(timestamp => timestamp > windowStart);
+    
+    // Add current request
+    entry.requests.push(now);
+    entry.count = entry.requests.length;
+
+    const resetTime = new Date(now + this.windowMs);
+    const current = entry.count;
+    const remaining = Math.max(0, this.max - current);
+
+    return {
+      limit: this.max,
+      current,
+      remaining,
+      resetTime
+    };
+  }
+
+  async resetKey(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
+  async get(key: string): Promise<RateLimitInfo | undefined> {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    const entry = this.store.get(key);
+
+    if (!entry || entry.resetTime <= now) {
+      return {
+        limit: this.max,
+        current: 0,
+        remaining: this.max,
+        resetTime: new Date(now + this.windowMs)
+      };
+    }
+
+    // Filter requests in current window
+    const validRequests = entry.requests.filter(timestamp => timestamp > windowStart);
+    const current = validRequests.length;
+    
+    return {
+      limit: this.max,
+      current,
+      remaining: Math.max(0, this.max - current),
+      resetTime: new Date(entry.resetTime)
+    };
+  }
+
+  async cleanup(): Promise<void> {
+    const now = Date.now();
+    const keysToDelete: string[] = [];
+
+    for (const [key, entry] of this.store.entries()) {
+      if (entry.resetTime <= now) {
+        keysToDelete.push(key);
+      }
+    }
+
+    keysToDelete.forEach(key => this.store.delete(key));
+  }
+
+  async resetAll(): Promise<void> {
+    this.store.clear();
+  }
+
+  destroy(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    this.store.clear();
+  }
+}
+```
+
+### `src/stores/RedisStore.ts`
+
+```typescript
+import { createClient, RedisClientType } from 'redis';
+import { Store, RateLimitInfo } from '../types';
+
+export interface RedisStoreOptions {
+  client?: RedisClientType;
+  prefix?: string;
+  windowMs: number;
+  max: number;
+  url?: string;
+}
+
+export class RedisStore implements Store {
+  private client: RedisClientType;
+  private prefix: string;
+  private windowMs: number;
+  private max: number;
+  private externalClient: boolean;
+
+  constructor(options: RedisStoreOptions) {
+    this.prefix = options.prefix || 'rl:';
+    this.windowMs = options.windowMs;
+    this.max = options.max;
+
+    if (options.client) {
+      this.client = options.client;
+      this.externalClient = true;
+    } else {
+      this.client = createClient({
+        url: options.url || 'redis://localhost:6379'
+      });
+      this.externalClient = false;
+      this.connect();
+    }
+  }
+
+  private async connect(): Promise<void> {
+    if (!this.client.isOpen) {
+      await this.client.connect();
+    }
+  }
+
+  private getKey(key: string): string {
+    return `${this.prefix}${key}`;
+  }
+
+  async increment(key: string): Promise<RateLimitInfo> {
+    const redisKey = this.getKey(key);
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+
+    // Use a Lua script for atomic operations
+    const script = `
+      local key = KEYS[1]
+      local now = tonumber(ARGV[1])
+      local windowStart = tonumber(ARGV[2])
+      local windowMs = tonumber(ARGV[3])
+      local max = tonumber(ARGV[4])
+      
+      -- Remove old entries
+      redis.call('ZREMRANGEBYSCORE', key, 0, windowStart)
+      
+      -- Get current count
+      local current = redis.call('ZCARD', key)
+      
+      -- Add new entry
+      redis.call('ZADD', key, now, now)
+      
+      -- Set expiry
+      redis.call('PEXPIRE', key, windowMs)
+      
+      -- Return current count after increment
+      return redis.call('ZCARD', key)
+    `;
+
+    try {
+      const current = await this.client.eval(script, {
+        keys: [redisKey],
+        arguments: [
+          now.toString(),
+          windowStart.toString(),
+          this.windowMs.toString(),
+          this.max.toString()
+        ]
+      }) as number;
+
+      const resetTime = new Date(now + this.windowMs);
+      const remaining = Math.max(0, this.max - current);
+
+      return {
+        limit: this.max,
+        current,
+        remaining,
+        resetTime
+      };
+    } catch (error) {
+      console.error('Redis error:', error);
+      throw error;
+    }
+  }
+
+  async resetKey(key: string): Promise<void> {
+    const redisKey = this.getKey(key);
+    await this.client.del(redisKey);
+  }
+
+  async get(key: string): Promise<RateLimitInfo | undefined> {
+    const redisKey = this.getKey(key);
+    const now = Date.now();
+    const windowStart = now - this
+ELAPSED_MS:33843

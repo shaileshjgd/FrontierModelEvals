@@ -1,0 +1,174 @@
+### Strategy and Architecture
+
+To build a production-ready rate limiter middleware for Express.js with the specified requirements, we'll follow these steps:
+
+1. **Sliding Window Algorithm**: We'll implement a sliding window algorithm that keeps track of request timestamps within a moving window to determine if the rate limit is exceeded.
+
+2. **Per-Route Configurable Limits**: We'll allow configuration of rate limits on a per-route basis. This means each route can have its own request limit and time window.
+
+3. **Storage Abstraction**: We'll create an abstraction layer for storage. By default, we'll use an in-memory storage, but we will provide a pluggable Redis adapter for distributed environments.
+
+4. **HTTP 429 Response**: When the rate limit is exceeded, the middleware will respond with HTTP 429, including `Retry-After` and `X-RateLimit-*` headers to inform the client about the rate limit status.
+
+5. **TypeScript Types**: We'll use TypeScript to ensure type safety throughout the implementation.
+
+6. **Unit Tests**: We'll write unit tests to validate the core algorithm and middleware behavior.
+
+### Implementation
+
+#### TypeScript Types and Interfaces
+
+```typescript
+interface RateLimitOptions {
+  windowMs: number; // Time window in milliseconds
+  max: number;      // Max number of requests within the window
+}
+
+interface RateLimiter {
+  consume(key: string, options: RateLimitOptions): Promise<boolean>;
+  get(key: string): Promise<{ remaining: number; reset: number }>;
+}
+
+interface RateLimitConfig {
+  [route: string]: RateLimitOptions;
+}
+```
+
+#### In-Memory Storage
+
+```typescript
+class InMemoryRateLimiter implements RateLimiter {
+  private storage: Map<string, number[]> = new Map();
+
+  async consume(key: string, options: RateLimitOptions): Promise<boolean> {
+    const now = Date.now();
+    const windowStart = now - options.windowMs;
+
+    if (!this.storage.has(key)) {
+      this.storage.set(key, []);
+    }
+
+    const timestamps = this.storage.get(key)!.filter(timestamp => timestamp > windowStart);
+    timestamps.push(now);
+
+    this.storage.set(key, timestamps);
+
+    return timestamps.length <= options.max;
+  }
+
+  async get(key: string): Promise<{ remaining: number; reset: number }> {
+    const now = Date.now();
+    const timestamps = this.storage.get(key) || [];
+    const reset = timestamps.length > 0 ? Math.max(...timestamps) : now;
+
+    return {
+      remaining: Math.max(0, options.max - timestamps.length),
+      reset,
+    };
+  }
+}
+```
+
+#### Redis Adapter (Optional)
+
+To implement a Redis adapter, you would need to use a library like `ioredis`. The adapter would follow the same interface as `InMemoryRateLimiter` but would use Redis commands to store and retrieve request timestamps.
+
+#### Middleware Implementation
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+function rateLimiterMiddleware(config: RateLimitConfig, limiter: RateLimiter) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const route = req.path;
+    const options = config[route];
+
+    if (!options) {
+      return next();
+    }
+
+    const key = `${route}:${req.ip}`;
+    const allowed = await limiter.consume(key, options);
+    const { remaining, reset } = await limiter.get(key);
+
+    res.setHeader('X-RateLimit-Limit', options.max);
+    res.setHeader('X-RateLimit-Remaining', remaining);
+    res.setHeader('X-RateLimit-Reset', reset);
+
+    if (!allowed) {
+      res.setHeader('Retry-After', Math.ceil((reset - Date.now()) / 1000));
+      return res.status(429).send('Too Many Requests');
+    }
+
+    next();
+  };
+}
+```
+
+#### Unit Tests
+
+For unit testing, we would use a testing framework like Jest. Here is an example test suite:
+
+```typescript
+import { InMemoryRateLimiter } from './InMemoryRateLimiter';
+import { rateLimiterMiddleware } from './rateLimiterMiddleware';
+import { Request, Response } from 'express';
+
+describe('Rate Limiter', () => {
+  let limiter: InMemoryRateLimiter;
+
+  beforeEach(() => {
+    limiter = new InMemoryRateLimiter();
+  });
+
+  it('should allow requests under the limit', async () => {
+    const req = { path: '/api/login', ip: '127.0.0.1' } as Request;
+    const res = {
+      setHeader: jest.fn(),
+      status: jest.fn(() => res),
+      send: jest.fn(),
+    } as unknown as Response;
+    const next = jest.fn();
+
+    const config = {
+      '/api/login': { windowMs: 60000, max: 5 },
+    };
+
+    const middleware = rateLimiterMiddleware(config, limiter);
+
+    for (let i = 0; i < 5; i++) {
+      await middleware(req, res, next);
+      expect(next).toHaveBeenCalled();
+    }
+  });
+
+  it('should block requests over the limit', async () => {
+    const req = { path: '/api/login', ip: '127.0.0.1' } as Request;
+    const res = {
+      setHeader: jest.fn(),
+      status: jest.fn(() => res),
+      send: jest.fn(),
+    } as unknown as Response;
+    const next = jest.fn();
+
+    const config = {
+      '/api/login': { windowMs: 60000, max: 5 },
+    };
+
+    const middleware = rateLimiterMiddleware(config, limiter);
+
+    for (let i = 0; i < 5; i++) {
+      await middleware(req, res, next);
+    }
+
+    await middleware(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.send).toHaveBeenCalledWith('Too Many Requests');
+  });
+});
+```
+
+### Conclusion
+
+This implementation provides a robust framework for rate limiting in an Express.js application using a sliding window algorithm with configurable limits for each route. It includes both an in-memory storage solution and a design pattern that allows for easy integration with Redis for distributed environments. The middleware will respond correctly with HTTP 429 and the appropriate headers when limits are exceeded.

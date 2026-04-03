@@ -1,0 +1,511 @@
+
+
+# Sliding Window Rate Limiter Middleware for Express.js
+
+## Project Structure
+
+```
+rate-limiter/
+├── src/
+│   ├── index.ts
+│   ├── middleware.ts
+│   ├── types.ts
+│   ├── stores/
+│   │   ├── store.interface.ts
+│   │   ├── memory.store.ts
+│   │   └── redis.store.ts
+│   ├── utils/
+│   │   └── key-generator.ts
+│   └── errors.ts
+├── tests/
+│   ├── middleware.test.ts
+│   ├── memory.store.test.ts
+│   ├── redis.store.test.ts
+│   └── integration.test.ts
+├── tsconfig.json
+├── package.json
+└── jest.config.js
+```
+
+## Source Files
+
+### `src/types.ts`
+
+```typescript
+import { Request, Response, NextFunction } from "express";
+
+/**
+ * Represents a single request record within the sliding window.
+ */
+export interface RequestRecord {
+  timestamp: number;
+}
+
+/**
+ * Result of a rate limit check against the store.
+ */
+export interface RateLimitResult {
+  /** Whether the request is allowed */
+  allowed: boolean;
+  /** Total number of allowed requests in the window */
+  limit: number;
+  /** Number of remaining requests in the current window */
+  remaining: number;
+  /** Unix timestamp (seconds) when the oldest request in the window expires */
+  resetAt: number;
+  /** Seconds until the client should retry (only set when blocked) */
+  retryAfter?: number;
+}
+
+/**
+ * Configuration for the rate limiter middleware.
+ */
+export interface RateLimiterOptions {
+  /** Maximum number of requests allowed within the window. Default: 100 */
+  maxRequests?: number;
+
+  /** Sliding window size in milliseconds. Default: 60000 (1 minute) */
+  windowMs?: number;
+
+  /**
+   * Function to derive the rate-limit key from the request.
+   * Default: uses `req.ip`.
+   */
+  keyGenerator?: (req: Request) => string;
+
+  /**
+   * Pluggable storage backend. Default: in-memory store.
+   */
+  store?: RateLimitStore;
+
+  /**
+   * Custom handler invoked when a request is rate-limited.
+   * If not provided, a default 429 JSON response is sent.
+   */
+  handler?: (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+    result: RateLimitResult
+  ) => void;
+
+  /**
+   * Whether to include standard rate limit headers. Default: true
+   */
+  headers?: boolean;
+
+  /**
+   * Whether to skip failed requests (status >= 400). Default: false
+   */
+  skipFailedRequests?: boolean;
+
+  /**
+   * Whether to skip successful requests (status < 400). Default: false
+   */
+  skipSuccessfulRequests?: boolean;
+
+  /**
+   * Optional function to skip rate limiting for certain requests entirely.
+   */
+  skip?: (req: Request) => boolean | Promise<boolean>;
+
+  /**
+   * Prefix for store keys, useful when sharing a Redis instance. Default: 'rl:'
+   */
+  keyPrefix?: string;
+}
+
+/**
+ * Interface that all storage backends must implement.
+ */
+export interface RateLimitStore {
+  /**
+   * Record a hit and return the current rate limit state.
+   * @param key - The unique identifier for the client+route
+   * @param windowMs - The sliding window duration in ms
+   * @param maxRequests - The maximum number of requests in the window
+   */
+  hit(
+    key: string,
+    windowMs: number,
+    maxRequests: number
+  ): Promise<RateLimitResult>;
+
+  /**
+   * Decrement the counter for the key (used when skipping requests).
+   */
+  decrement(key: string): Promise<void>;
+
+  /**
+   * Reset the counter for a specific key.
+   */
+  reset(key: string): Promise<void>;
+
+  /**
+   * Clean up resources (timers, connections, etc.).
+   */
+  destroy?(): Promise<void>;
+}
+
+/**
+ * Augment Express Request to expose rate limit info downstream.
+ */
+declare global {
+  namespace Express {
+    interface Request {
+      rateLimit?: RateLimitResult;
+    }
+  }
+}
+```
+
+### `src/errors.ts`
+
+```typescript
+export class RateLimiterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RateLimiterError";
+    Object.setPrototypeOf(this, RateLimiterError.prototype);
+  }
+}
+
+export class StoreError extends RateLimiterError {
+  constructor(message: string, public readonly cause?: Error) {
+    super(message);
+    this.name = "StoreError";
+    Object.setPrototypeOf(this, StoreError.prototype);
+  }
+}
+```
+
+### `src/stores/store.interface.ts`
+
+```typescript
+// Re-export for convenience
+export type { RateLimitStore, RateLimitResult } from "../types";
+```
+
+### `src/stores/memory.store.ts`
+
+```typescript
+import { RateLimitStore, RateLimitResult } from "../types";
+
+interface WindowEntry {
+  timestamps: number[];
+}
+
+/**
+ * In-memory sliding window rate limit store.
+ *
+ * Uses a sorted array of timestamps per key. On each hit, expired entries
+ * outside the window are pruned. A periodic sweep removes stale keys entirely.
+ */
+export class MemoryStore implements RateLimitStore {
+  private store: Map<string, WindowEntry> = new Map();
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly cleanupIntervalMs: number;
+
+  constructor(options?: { cleanupIntervalMs?: number }) {
+    this.cleanupIntervalMs = options?.cleanupIntervalMs ?? 60_000;
+    this.startCleanup();
+  }
+
+  async hit(
+    key: string,
+    windowMs: number,
+    maxRequests: number
+  ): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+
+    let entry = this.store.get(key);
+    if (!entry) {
+      entry = { timestamps: [] };
+      this.store.set(key, entry);
+    }
+
+    // Prune timestamps outside the current window
+    entry.timestamps = entry.timestamps.filter((t) => t > windowStart);
+
+    // Calculate current count BEFORE adding the new request
+    const currentCount = entry.timestamps.length;
+    const allowed = currentCount < maxRequests;
+
+    if (allowed) {
+      entry.timestamps.push(now);
+    }
+
+    const remaining = allowed
+      ? maxRequests - currentCount - 1
+      : 0;
+
+    // resetAt: when the oldest timestamp in the window will expire
+    const oldestInWindow =
+      entry.timestamps.length > 0 ? entry.timestamps[0] : now;
+    const resetAt = Math.ceil((oldestInWindow + windowMs) / 1000);
+
+    const result: RateLimitResult = {
+      allowed,
+      limit: maxRequests,
+      remaining: Math.max(0, remaining),
+      resetAt,
+    };
+
+    if (!allowed) {
+      // Time until the oldest request falls out of the window
+      const retryAfterMs = oldestInWindow + windowMs - now;
+      result.retryAfter = Math.ceil(retryAfterMs / 1000);
+    }
+
+    return result;
+  }
+
+  async decrement(key: string): Promise<void> {
+    const entry = this.store.get(key);
+    if (entry && entry.timestamps.length > 0) {
+      // Remove the most recent timestamp
+      entry.timestamps.pop();
+    }
+  }
+
+  async reset(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
+  async destroy(): Promise<void> {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+    this.store.clear();
+  }
+
+  /** Visible for testing */
+  get size(): number {
+    return this.store.size;
+  }
+
+  private startCleanup(): void {
+    this.cleanupTimer = setInterval(() => {
+      const now = Date.now();
+      // We don't know per-key windowMs, so we use a generous 5-minute TTL
+      // for the sweep. Actual per-request pruning happens in `hit()`.
+      for (const [key, entry] of this.store.entries()) {
+        // Remove keys with no timestamps or all timestamps older than 5 min
+        if (
+          entry.timestamps.length === 0 ||
+          entry.timestamps.every((t) => t < now - 300_000)
+        ) {
+          this.store.delete(key);
+        }
+      }
+    }, this.cleanupIntervalMs);
+
+    // Allow the Node process to exit even if the timer is active
+    if (this.cleanupTimer?.unref) {
+      this.cleanupTimer.unref();
+    }
+  }
+}
+```
+
+### `src/stores/redis.store.ts`
+
+```typescript
+import { RateLimitStore, RateLimitResult } from "../types";
+import { StoreError } from "../errors";
+
+/**
+ * Minimal interface for the Redis client we accept.
+ * Compatible with `ioredis` and `redis` v4+ (node-redis).
+ */
+export interface RedisClient {
+  multi(): RedisPipeline;
+  eval(
+    script: string,
+    numkeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
+  evalsha?(
+    sha: string,
+    numkeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
+  del(key: string): Promise<number>;
+}
+
+export interface RedisPipeline {
+  zremrangebyscore(
+    key: string,
+    min: number | string,
+    max: number | string
+  ): RedisPipeline;
+  zadd(key: string, ...args: (string | number)[]): RedisPipeline;
+  zcard(key: string): RedisPipeline;
+  zrange(
+    key: string,
+    start: number,
+    stop: number,
+    ...args: string[]
+  ): RedisPipeline;
+  pexpire(key: string, ms: number): RedisPipeline;
+  exec(): Promise<unknown[]>;
+}
+
+export interface RedisStoreOptions {
+  /** An existing Redis client instance */
+  client: RedisClient;
+  /** Key prefix. Default: 'rl:' */
+  prefix?: string;
+}
+
+/**
+ * Lua script for atomic sliding window rate limiting.
+ *
+ * KEYS[1] = the sorted set key
+ * ARGV[1] = window start timestamp (ms)
+ * ARGV[2] = current timestamp (ms) — used as both score and member uniqueness
+ * ARGV[3] = max requests
+ * ARGV[4] = window size (ms) for pexpire
+ * ARGV[5] = unique member suffix (to avoid collisions at same ms)
+ *
+ * Returns: { count_before_add, oldest_score, was_added (0/1) }
+ */
+const SLIDING_WINDOW_LUA = `
+local key = KEYS[1]
+local windowStart = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local maxRequests = tonumber(ARGV[3])
+local windowMs = tonumber(ARGV[4])
+local uniqueSuffix = ARGV[5]
+
+-- Remove expired entries
+redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)
+
+-- Count current entries
+local currentCount = redis.call('ZCARD', key)
+
+local added = 0
+if currentCount < maxRequests then
+  -- Add new entry with score = now, member = now:uniqueSuffix
+  redis.call('ZADD', key, now, now .. ':' .. uniqueSuffix)
+  added = 1
+end
+
+-- Get oldest entry score
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+local oldestScore = 0
+if #oldest >= 2 then
+  oldestScore = tonumber(oldest[2])
+end
+
+-- Set expiry on the key
+redis.call('PEXPIRE', key, windowMs)
+
+return {currentCount, oldestScore, added}
+`;
+
+let counter = 0;
+
+/**
+ * Redis-backed sliding window rate limit store using sorted sets.
+ * Each request is a member with score = timestamp. Expired members
+ * are pruned atomically via Lua script.
+ */
+export class RedisStore implements RateLimitStore {
+  private readonly client: RedisClient;
+  private readonly prefix: string;
+
+  constructor(options: RedisStoreOptions) {
+    if (!options.client) {
+      throw new StoreError("Redis client is required");
+    }
+    this.client = options.client;
+    this.prefix = options.prefix ?? "rl:";
+  }
+
+  async hit(
+    key: string,
+    windowMs: number,
+    maxRequests: number
+  ): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowStart = now - windowMs;
+    const fullKey = this.prefix + key;
+    const uniqueSuffix = `${process.pid}-${counter++}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+
+    try {
+      const result = (await this.client.eval(
+        SLIDING_WINDOW_LUA,
+        1,
+        fullKey,
+        windowStart,
+        now,
+        maxRequests,
+        windowMs,
+        uniqueSuffix
+      )) as number[];
+
+      const [currentCount, oldestScore, wasAdded] = result;
+      const allowed = wasAdded === 1;
+      const totalAfter = allowed ? currentCount + 1 : currentCount;
+      const remaining = Math.max(0, maxRequests - totalAfter);
+
+      const oldestInWindow = oldestScore > 0 ? oldestScore : now;
+      const resetAt = Math.ceil((oldestInWindow + windowMs) / 1000);
+
+      const rateLimitResult: RateLimitResult = {
+        allowed,
+        limit: maxRequests,
+        remaining,
+        resetAt,
+      };
+
+      if (!allowed) {
+        const retryAfterMs = oldestInWindow + windowMs - now;
+        rateLimitResult.retryAfter = Math.ceil(retryAfterMs / 1000);
+      }
+
+      return rateLimitResult;
+    } catch (err) {
+      throw new StoreError(
+        "Redis rate limit check failed",
+        err instanceof Error ? err : new Error(String(err))
+      );
+    }
+  }
+
+  async decrement(key: string): Promise<void> {
+    const fullKey = this.prefix + key;
+    try {
+      // Remove the most recently added member (highest score)
+      const pipeline = this.client.multi();
+      // We use a Lua script to pop the highest-scored member
+      await this.client.eval(
+        `
+        local key = KEYS[1]
+        local members = redis.call('ZRANGE', key, -1, -1)
+        if #members > 0 then
+          redis.call('ZREM', key, members[1])
+        end
+        return 1
+        `,
+        1,
+        fullKey
+      );
+    } catch (err) {
+      throw new StoreError(
+        "Redis decrement failed",
+        err instanceof Error ? err : new Error(String(err))
+      );
+    }
+  }
+
+  async reset(key: string): Promise<void> {
+    const fullKey = this.prefix + key;
+    try {
+      await this.client.del(fullKey);
+ELAPSED_MS:53815

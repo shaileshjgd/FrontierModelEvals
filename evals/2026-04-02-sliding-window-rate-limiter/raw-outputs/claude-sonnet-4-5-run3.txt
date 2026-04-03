@@ -1,0 +1,524 @@
+# Production-Ready Sliding Window Rate Limiter for Express.js
+
+I'll create a comprehensive rate limiter with all the requested features.
+
+## Project Structure
+
+```
+rate-limiter/
+├── src/
+│   ├── index.ts
+│   ├── middleware.ts
+│   ├── stores/
+│   │   ├── Store.ts
+│   │   ├── MemoryStore.ts
+│   │   └── RedisStore.ts
+│   └── types.ts
+├── tests/
+│   ├── middleware.test.ts
+│   ├── MemoryStore.test.ts
+│   └── RedisStore.test.ts
+├── package.json
+└── tsconfig.json
+```
+
+## Implementation
+
+### `package.json`
+
+```json
+{
+  "name": "@company/rate-limiter",
+  "version": "1.0.0",
+  "description": "Production-ready sliding window rate limiter for Express.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "keywords": ["rate-limiter", "express", "middleware", "sliding-window"],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.17",
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "@types/redis": "^4.0.11",
+    "jest": "^29.5.0",
+    "redis": "^4.6.5",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "redis": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "redis": {
+      "optional": true
+    }
+  }
+}
+```
+
+### `tsconfig.json`
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "declaration": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}
+```
+
+### `src/types.ts`
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+export interface RateLimitInfo {
+  limit: number;
+  current: number;
+  remaining: number;
+  resetTime: Date;
+}
+
+export interface RateLimitResult {
+  allowed: boolean;
+  limit: number;
+  current: number;
+  remaining: number;
+  resetTime: number;
+}
+
+export interface RateLimiterOptions {
+  /**
+   * Time window in milliseconds
+   * @default 60000 (1 minute)
+   */
+  windowMs?: number;
+
+  /**
+   * Maximum number of requests per window
+   * @default 100
+   */
+  max?: number;
+
+  /**
+   * Storage adapter
+   * @default MemoryStore
+   */
+  store?: Store;
+
+  /**
+   * Key generator function
+   * @default IP address
+   */
+  keyGenerator?: (req: Request) => string;
+
+  /**
+   * Skip requests that match this function
+   */
+  skip?: (req: Request) => boolean | Promise<boolean>;
+
+  /**
+   * Handler called when rate limit is exceeded
+   */
+  handler?: (req: Request, res: Response, next: NextFunction) => void;
+
+  /**
+   * Customize response headers
+   */
+  standardHeaders?: boolean;
+
+  /**
+   * Add legacy X-RateLimit headers
+   */
+  legacyHeaders?: boolean;
+
+  /**
+   * Skip failed requests (requests that resulted in an error)
+   */
+  skipFailedRequests?: boolean;
+
+  /**
+   * Skip successful requests (requests that didn't result in an error)
+   */
+  skipSuccessfulRequests?: boolean;
+
+  /**
+   * Custom message when rate limit is exceeded
+   */
+  message?: string | ((req: Request, res: Response) => string);
+
+  /**
+   * Status code to send when rate limit is exceeded
+   * @default 429
+   */
+  statusCode?: number;
+}
+
+export interface Store {
+  /**
+   * Increment the counter for a key
+   */
+  increment(key: string): Promise<RateLimitResult>;
+
+  /**
+   * Decrement the counter for a key
+   */
+  decrement(key: string): Promise<void>;
+
+  /**
+   * Reset the counter for a key
+   */
+  resetKey(key: string): Promise<void>;
+
+  /**
+   * Reset all counters
+   */
+  resetAll(): Promise<void>;
+
+  /**
+   * Get current info for a key
+   */
+  get(key: string): Promise<RateLimitInfo | undefined>;
+}
+
+export interface StoreOptions {
+  windowMs: number;
+  max: number;
+}
+```
+
+### `src/stores/Store.ts`
+
+```typescript
+import { Store, StoreOptions, RateLimitInfo, RateLimitResult } from '../types';
+
+export abstract class BaseStore implements Store {
+  protected windowMs: number;
+  protected max: number;
+
+  constructor(options: StoreOptions) {
+    this.windowMs = options.windowMs;
+    this.max = options.max;
+  }
+
+  abstract increment(key: string): Promise<RateLimitResult>;
+  abstract decrement(key: string): Promise<void>;
+  abstract resetKey(key: string): Promise<void>;
+  abstract resetAll(): Promise<void>;
+  abstract get(key: string): Promise<RateLimitInfo | undefined>;
+
+  protected calculateResetTime(): number {
+    return Date.now() + this.windowMs;
+  }
+
+  protected isExpired(resetTime: number): boolean {
+    return Date.now() >= resetTime;
+  }
+}
+```
+
+### `src/stores/MemoryStore.ts`
+
+```typescript
+import { BaseStore } from './Store';
+import { RateLimitInfo, RateLimitResult, StoreOptions } from '../types';
+
+interface WindowEntry {
+  timestamps: number[];
+  resetTime: number;
+}
+
+export class MemoryStore extends BaseStore {
+  private hits: Map<string, WindowEntry>;
+  private cleanupInterval: NodeJS.Timeout;
+  private readonly cleanupIntervalMs = 60000; // Clean up every minute
+
+  constructor(options: StoreOptions) {
+    super(options);
+    this.hits = new Map();
+    
+    // Periodic cleanup to prevent memory leaks
+    this.cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, this.cleanupIntervalMs);
+    
+    // Don't block Node.js from exiting
+    if (this.cleanupInterval.unref) {
+      this.cleanupInterval.unref();
+    }
+  }
+
+  async increment(key: string): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    
+    let entry = this.hits.get(key);
+    
+    if (!entry || this.isExpired(entry.resetTime)) {
+      // Create new entry
+      entry = {
+        timestamps: [now],
+        resetTime: this.calculateResetTime(),
+      };
+      this.hits.set(key, entry);
+    } else {
+      // Filter out timestamps outside the sliding window
+      entry.timestamps = entry.timestamps.filter(ts => ts > windowStart);
+      entry.timestamps.push(now);
+    }
+
+    const current = entry.timestamps.length;
+    const remaining = Math.max(0, this.max - current);
+    const allowed = current <= this.max;
+
+    return {
+      allowed,
+      limit: this.max,
+      current,
+      remaining,
+      resetTime: entry.resetTime,
+    };
+  }
+
+  async decrement(key: string): Promise<void> {
+    const entry = this.hits.get(key);
+    if (entry && entry.timestamps.length > 0) {
+      entry.timestamps.pop();
+    }
+  }
+
+  async resetKey(key: string): Promise<void> {
+    this.hits.delete(key);
+  }
+
+  async resetAll(): Promise<void> {
+    this.hits.clear();
+  }
+
+  async get(key: string): Promise<RateLimitInfo | undefined> {
+    const entry = this.hits.get(key);
+    if (!entry || this.isExpired(entry.resetTime)) {
+      return undefined;
+    }
+
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    const validTimestamps = entry.timestamps.filter(ts => ts > windowStart);
+    const current = validTimestamps.length;
+
+    return {
+      limit: this.max,
+      current,
+      remaining: Math.max(0, this.max - current),
+      resetTime: new Date(entry.resetTime),
+    };
+  }
+
+  private cleanup(): void {
+    const now = Date.now();
+    const keysToDelete: string[] = [];
+
+    for (const [key, entry] of this.hits.entries()) {
+      if (this.isExpired(entry.resetTime)) {
+        keysToDelete.push(key);
+      } else {
+        // Clean up old timestamps within valid entries
+        const windowStart = now - this.windowMs;
+        entry.timestamps = entry.timestamps.filter(ts => ts > windowStart);
+        
+        if (entry.timestamps.length === 0) {
+          keysToDelete.push(key);
+        }
+      }
+    }
+
+    for (const key of keysToDelete) {
+      this.hits.delete(key);
+    }
+  }
+
+  destroy(): void {
+    clearInterval(this.cleanupInterval);
+    this.hits.clear();
+  }
+}
+```
+
+### `src/stores/RedisStore.ts`
+
+```typescript
+import { BaseStore } from './Store';
+import { RateLimitInfo, RateLimitResult, StoreOptions } from '../types';
+
+// This will be optionally imported by users
+export interface RedisClient {
+  zadd(key: string, score: number, member: string): Promise<number>;
+  zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number>;
+  zcard(key: string): Promise<number>;
+  expire(key: string, seconds: number): Promise<number>;
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, options?: any): Promise<string | null>;
+  del(key: string): Promise<number>;
+  keys(pattern: string): Promise<string[]>;
+}
+
+export interface RedisStoreOptions extends StoreOptions {
+  client: RedisClient;
+  prefix?: string;
+}
+
+export class RedisStore extends BaseStore {
+  private client: RedisClient;
+  private prefix: string;
+
+  constructor(options: RedisStoreOptions) {
+    super(options);
+    this.client = options.client;
+    this.prefix = options.prefix || 'rl:';
+  }
+
+  private getKey(key: string): string {
+    return `${this.prefix}${key}`;
+  }
+
+  private getResetKey(key: string): string {
+    return `${this.prefix}${key}:reset`;
+  }
+
+  async increment(key: string): Promise<RateLimitResult> {
+    const redisKey = this.getKey(key);
+    const resetKey = this.getResetKey(key);
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+
+    try {
+      // Use a transaction-like approach
+      // 1. Remove expired entries
+      await this.client.zremrangebyscore(redisKey, 0, windowStart);
+
+      // 2. Add current timestamp
+      await this.client.zadd(redisKey, now, `${now}-${Math.random()}`);
+
+      // 3. Get current count
+      const current = await this.client.zcard(redisKey);
+
+      // 4. Set expiration
+      const ttlSeconds = Math.ceil(this.windowMs / 1000);
+      await this.client.expire(redisKey, ttlSeconds);
+
+      // 5. Get or set reset time
+      let resetTime = await this.client.get(resetKey);
+      if (!resetTime || parseInt(resetTime) < now) {
+        const newResetTime = this.calculateResetTime();
+        await this.client.set(resetKey, newResetTime.toString(), {
+          EX: ttlSeconds,
+        });
+        resetTime = newResetTime.toString();
+      }
+
+      const remaining = Math.max(0, this.max - current);
+      const allowed = current <= this.max;
+
+      return {
+        allowed,
+        limit: this.max,
+        current,
+        remaining,
+        resetTime: parseInt(resetTime),
+      };
+    } catch (error) {
+      console.error('Redis error in increment:', error);
+      throw error;
+    }
+  }
+
+  async decrement(key: string): Promise<void> {
+    const redisKey = this.getKey(key);
+    
+    try {
+      // Remove the most recent entry
+      const members = await this.client.zcard(redisKey);
+      if (members > 0) {
+        // Get all members and remove the last one
+        // Note: This is a simplified implementation
+        // In production, you might want to track specific request IDs
+        const now = Date.now();
+        await this.client.zremrangebyscore(redisKey, now - 1000, now);
+      }
+    } catch (error) {
+      console.error('Redis error in decrement:', error);
+      throw error;
+    }
+  }
+
+  async resetKey(key: string): Promise<void> {
+    const redisKey = this.getKey(key);
+    const resetKey = this.getResetKey(key);
+    
+    try {
+      await Promise.all([
+        this.client.del(redisKey),
+        this.client.del(resetKey),
+      ]);
+    } catch (error) {
+      console.error('Redis error in resetKey:', error);
+      throw error;
+    }
+  }
+
+  async resetAll(): Promise<void> {
+    try {
+      const keys = await this.client.keys(`${this.prefix}*`);
+      if (keys.length > 0) {
+        await Promise.all(keys.map(key => this.client.del(key)));
+      }
+    } catch (error) {
+      console.error('Redis error in resetAll:', error);
+      throw error;
+    }
+  }
+
+  async get(key: string): Promise<RateLimitInfo | undefined> {
+    const redisKey = this.getKey(key);
+    const resetKey = this.getResetKey(key);
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+
+    try {
+      // Remove expired entries
+      await this.client.zremrangebyscore(redisKey, 0, windowStart);
+
+      const [current, resetTimeStr] = await Promise.all([
+        this.client.zcard(redisKey),
+        this.client.get(resetKey),
+      ]);
+
+      if (!resetTimeStr) {
+        
+ELAPSED_MS:45840

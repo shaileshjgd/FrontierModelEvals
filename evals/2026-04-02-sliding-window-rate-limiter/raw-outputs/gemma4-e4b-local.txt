@@ -1,0 +1,277 @@
+As a senior software engineer, I approach this problem by prioritizing **separation of concerns**, **testability**, and **extensibility**. The architecture must cleanly separate the core rate-limiting algorithm from the storage mechanism and the HTTP framework (Express).
+
+## 🚀 Strategy and Architecture Outline
+
+### 1. Architecture Components
+
+| Component | Responsibility | Details |
+| :--- | :--- | :--- |
+| **`StorageAdapter`** | Manages persistent storage (key-value pairs, timestamps). | Defines the `IStorage` interface. Concrete implementations: `MemoryStorage` (default) and `RedisStorage`. |
+| **`RateLimiter`** | Implements the core business logic (Sliding Window). | Takes a `StorageAdapter` dependency. Calculates if a request is allowed, records usage, and determines the time until the next request is allowed. |
+| **`RateLimitMiddleware`** | Integrates the logic into Express.js. | Acts as the Express middleware function (`(req, res, next) => {}`). Reads configuration from the request context/path and calls the `RateLimiter`. Handles 429 responses. |
+| **`Config`** | Defines the limits. | A map or object specifying limits per route/method (e.g., `['POST', '/api/login']`). |
+
+### 2. Sliding Window Algorithm Implementation
+
+The Sliding Window algorithm is implemented by tracking the timestamps of the last $N$ requests for a given user/key.
+
+1.  **Key Generation:** A unique key is created (e.g., `rate_limit:{user_id}:{route_key}`).
+2.  **Window Check:** When a request comes in, we check the stored timestamps.
+3.  **Cleanup:** We first prune any timestamps older than the current window size (Time $T - N$).
+4.  **Limit Check:** If the count of remaining timestamps is less than the allowed limit $L$, the request is allowed. We add the current timestamp and return success.
+5.  **Rejection:** If the count equals or exceeds $L$, the request is rejected. The `Retry-After` header is calculated based on the timestamp of the oldest request still within the window.
+
+### 3. Dependency Injection & Abstraction
+
+By defining the `IStorage` interface, we achieve maximum pluggability. The `RateLimiter` class only depends on this interface, meaning we can swap `MemoryStorage` for `RedisStorage` without altering the core logic.
+
+---
+
+## 💻 Complete Implementation
+
+We will structure this into a modular TypeScript project.
+
+### 1. Types and Interfaces (`src/types.ts`)
+
+```typescript
+/**
+ * Represents the fundamental storage operations required by the RateLimiter.
+ * This is the core abstraction layer.
+ */
+export interface IStorage {
+    /**
+     * Gets the list of timestamps for a given key.
+     * @param key The unique identifier (e.g., user ID + route).
+     * @returns A promise resolving to an array of timestamps (numbers).
+     */
+    get(key: string): Promise<number[] | null>;
+
+    /**
+     * Sets or updates the list of timestamps for a given key.
+     * @param key The unique identifier.
+     * @param timestamps The array of timestamps to store.
+     * @param expirySeconds How long the key should live in the cache.
+     */
+    set(key: string, timestamps: number[], expirySeconds: number): Promise<void>;
+}
+
+/**
+ * Configuration structure for a specific route/method combination.
+ */
+export interface LimitConfig {
+    limit: number; // Max requests allowed
+    windowSeconds: number; // The duration of the window (e.g., 60 seconds)
+}
+
+/**
+ * The result object returned by the rate limiter check.
+ */
+export interface RateLimitResult {
+    allowed: boolean;
+    remaining: number;
+    limit: number;
+    resetTime: number; // Unix timestamp when the limit resets
+    retryAfterSeconds: number; // Seconds until next request is allowed
+}
+
+/**
+ * Defines the required headers for a rate limit response.
+ */
+export interface RateLimitHeaders {
+    'X-RateLimit-Limit': string;
+    'X-RateLimit-Remaining': string;
+    'X-RateLimit-Reset': string;
+    'Retry-After': string;
+}
+```
+
+### 2. Storage Adapters (`src/storage.ts`)
+
+#### A. In-Memory Storage (Default)
+
+```typescript
+import { IStorage } from './types';
+
+/**
+ * Simple, non-persistent, in-memory storage implementation.
+ * WARNING: Data is lost upon process restart.
+ */
+export class MemoryStorage implements IStorage {
+    private cache: Map<string, { data: number[], expires: number }>;
+
+    constructor() {
+        this.cache = new Map();
+    }
+
+    async get(key: string): Promise<number[] | null> {
+        const entry = this.cache.get(key);
+        if (!entry || entry.expires < Date.now()) {
+            this.cache.delete(key);
+            return null;
+        }
+        return entry.data;
+    }
+
+    async set(key: string, timestamps: number[], expirySeconds: number): Promise<void> {
+        const expires = Date.now() + expirySeconds * 1000;
+        this.cache.set(key, { data: timestamps, expires });
+    }
+}
+```
+
+#### B. Redis Storage (Pluggable Adapter)
+
+*(Note: For brevity, I am using a stub for the actual Redis client interaction, assuming a standard `redis` client setup.)*
+
+```typescript
+import { IStorage } from './types';
+// Assume 'redis' client is imported and initialized
+// import { RedisClientType } from 'redis';
+
+/**
+ * Placeholder for a real Redis implementation.
+ * In a real app, this would use Redis commands like LPUSH, LTRIM, and EXPIRE.
+ */
+export class RedisStorage implements IStorage {
+    private client: any; // Placeholder for Redis client
+
+    constructor(redisClient: any) {
+        this.client = redisClient;
+        console.log("RedisStorage initialized. Using mock connection.");
+    }
+
+    // Mock implementation for demonstration
+    async get(key: string): Promise<number[] | null> {
+        // In reality: await this.client.lrange(key, 0, -1)
+        // For simulation:
+        return null; 
+    }
+
+    async set(key: string, timestamps: number[], expirySeconds: number): Promise<void> {
+        // In reality: await this.client.lpush(key, ...timestamps); await this.client.expire(key, expirySeconds);
+        console.log(`[Redis Mock] Set key ${key} with ${timestamps.length} timestamps, expiring in ${expirySeconds}s.`);
+    }
+}
+```
+
+### 3. Core Rate Limiter Logic (`src/rate-limiter.ts`)
+
+```typescript
+import { IStorage, LimitConfig, RateLimitResult, RateLimitHeaders } from './types';
+
+export class RateLimiter {
+    private storage: IStorage;
+
+    constructor(storage: IStorage) {
+        this.storage = storage;
+    }
+
+    /**
+     * Calculates the rate limit result based on the sliding window algorithm.
+     * @param key The unique identifier for the user/client (e.g., IP address or User ID).
+     * @param config The limit configuration (limit and window).
+     * @returns A RateLimitResult object.
+     */
+    public async checkLimit(key: string, config: LimitConfig): Promise<RateLimitResult> {
+        const now = Math.floor(Date.now() / 1000);
+        const windowSeconds = config.windowSeconds;
+        const limit = config.limit;
+        const storageKey = `rate_limit:${key}:${windowSeconds}`;
+
+        // 1. Retrieve existing timestamps
+        const timestamps: number[] | null = await this.storage.get(storageKey);
+        
+        let currentTimestamps: number[] = timestamps ? [...timestamps] : [];
+
+        // 2. Cleanup: Remove timestamps older than the window
+        const windowStart = now - windowSeconds;
+        currentTimestamps = currentTimestamps.filter(ts => ts >= windowStart);
+
+        // 3. Check Limit
+        if (currentTimestamps.length >= limit) {
+            // Limit exceeded
+            const oldestTimestamp = currentTimestamps[0];
+            const resetTime = Math.floor(oldestTimestamp + windowSeconds);
+            const retryAfterSeconds = Math.ceil((oldestTimestamp + windowSeconds - now) / 1000);
+
+            return {
+                allowed: false,
+                remaining: 0,
+                limit: limit,
+                resetTime: resetTime,
+                retryAfterSeconds: Math.max(1, retryAfterSeconds) // Ensure at least 1 second
+            };
+        }
+
+        // 4. Allowed: Record new request and update storage
+        const newTimestamps = [now, ...currentTimestamps];
+        await this.storage.set(storageKey, newTimestamps, windowSeconds + 5); // Set expiry slightly longer than window
+        
+        const remaining = limit - newTimestamps.length;
+
+        return {
+            allowed: true,
+            remaining: remaining,
+            limit: limit,
+            resetTime: Math.floor(now + windowSeconds),
+            retryAfterSeconds: Math.max(1, windowSeconds - (now - windowStart))
+        };
+    }
+    
+    /**
+     * Converts the rate limit result into standard HTTP headers.
+     */
+    public toHeaders(result: RateLimitResult): RateLimitHeaders {
+        const now = Math.floor(Date.now() / 1000);
+        const resetTime = result.resetTime;
+
+        return {
+            'X-RateLimit-Limit': String(result.limit),
+            'X-RateLimit-Remaining': String(result.remaining),
+            'X-RateLimit-Reset': String(resetTime),
+            'Retry-After': String(result.retryAfterSeconds)
+        };
+    }
+}
+```
+
+### 4. Express Middleware (`src/middleware.ts`)
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { RateLimiter } from './rate-limiter';
+import { LimitConfig, RateLimitResult, RateLimitHeaders } from './types';
+import { MemoryStorage } from './storage';
+
+/**
+ * Middleware function that enforces rate limits based on configuration.
+ * @param rateLimiter An initialized RateLimiter instance.
+ * @param configMap A map defining limits for specific routes/methods.
+ * @param keyExtractor A function to extract a unique identifier (e.g., req.ip, req.user.id).
+ */
+export const rateLimitMiddleware = (
+    rateLimiter: RateLimiter, 
+    configMap: Map<string, LimitConfig>,
+    keyExtractor: (req: Request) => string
+) => {
+    return async (req: Request, res: Response, next: NextFunction) => {
+        // 1. Determine the unique key (e.g., user ID)
+        const key = keyExtractor(req);
+
+        // 2. Construct the lookup key (e.g., POST:/api/login)
+        const routeKey = `${req.method}:${req.path}`;
+        const config = configMap.get(routeKey);
+
+        if (!config) {
+            // No rate limit defined for this route, proceed normally
+            return next();
+        }
+
+        try {
+            // 3. Check the limit
+            const result: RateLimitResult = await rateLimiter.checkLimit(key, config);
+
+            // 4. Handle Rate Limit Exceeded (HTTP 429)
+            if (!result.allowed) {
+                // Set standard rate limit headers even on failure
+                res.set(

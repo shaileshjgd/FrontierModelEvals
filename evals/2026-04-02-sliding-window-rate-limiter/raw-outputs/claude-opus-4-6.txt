@@ -1,0 +1,337 @@
+
+
+# Production-Ready Sliding Window Rate Limiter for Express.js
+
+## Strategy & Architecture
+
+### Algorithm Choice: Sliding Window Log
+
+I'll implement the **sliding window log** algorithm (not the approximation/counter hybrid). This tracks individual request timestamps within the window, giving exact counts. For high-throughput scenarios, I'll also note where the counter approximation would plug in, but the log approach is more correct and the requirements call for production-ready accuracy.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Middleware Layer                    │
+│  rateLimiter(config) → Express.RequestHandler        │
+│  - Route matching & config resolution                │
+│  - Header generation (429, Retry-After, X-RateLimit) │
+│  - Key extraction (IP, user, custom)                 │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────┐
+│              Core Algorithm Layer                     │
+│  SlidingWindowRateLimiter                            │
+│  - slidingWindowCheck(key, limit, windowMs) → Result │
+│  - Delegates to storage adapter                      │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────┐
+│              Storage Abstraction Layer                │
+│  interface RateLimitStore                            │
+│  ├── MemoryStore (default, with auto-cleanup)        │
+│  └── RedisStore  (pluggable, uses Lua scripts)       │
+└─────────────────────────────────────────────────────┘
+```
+
+### Key Design Decisions
+
+1. **Sliding window log** stores timestamps of each request; on check, we prune expired entries and count remaining ones. This gives exact sliding window semantics.
+2. **Storage interface** exposes a single atomic `hit()` method that returns current count and reset time — keeps atomicity concerns inside the store.
+3. **Redis adapter** uses Lua scripting for atomic ZRANGEBYSCORE + ZREMRANGEBYSCORE + ZADD — no race conditions.
+4. **Route matching** supports exact paths, glob patterns via `picomatch`, and a fallback default.
+5. **Key extraction** is pluggable (default: IP-based) so users can rate-limit by user ID, API key, etc.
+6. **Memory store** uses a `Map<string, number[]>` with a periodic sweep interval to prevent memory leaks from expired entries.
+
+---
+
+## Complete Implementation
+
+### Project Structure
+
+```
+src/
+├── types.ts              # All TypeScript interfaces and types
+├── stores/
+│   ├── store.interface.ts # Storage abstraction
+│   ├── memory.store.ts    # In-memory implementation
+│   └── redis.store.ts     # Redis implementation
+├── algorithm.ts           # Core sliding window logic
+├── middleware.ts           # Express middleware factory
+└── index.ts               # Public API exports
+tests/
+├── algorithm.test.ts
+├── middleware.test.ts
+├── memory-store.test.ts
+└── redis-store.test.ts
+```
+
+### types.ts
+
+```typescript
+// src/types.ts
+
+import { Request, Response, NextFunction, RequestHandler } from 'express';
+
+/**
+ * Result of a rate limit check against the sliding window.
+ */
+export interface RateLimitResult {
+  /** Whether the request is allowed */
+  allowed: boolean;
+  /** Current number of requests in the window */
+  currentCount: number;
+  /** Maximum requests allowed in the window */
+  limit: number;
+  /** Remaining requests allowed in the current window */
+  remaining: number;
+  /** Unix timestamp (seconds) when the window resets for the oldest entry */
+  resetAt: number;
+  /** Milliseconds until the client should retry (only meaningful when blocked) */
+  retryAfterMs: number;
+}
+
+/**
+ * Configuration for a single rate limit rule.
+ */
+export interface RateLimitRule {
+  /** Maximum number of requests allowed in the window */
+  limit: number;
+  /** Window size in milliseconds */
+  windowMs: number;
+}
+
+/**
+ * Per-route rate limit configuration.
+ * Keys are route patterns (exact match or glob patterns).
+ * A special key "default" serves as the fallback.
+ */
+export interface RouteRateLimitConfig {
+  [routePattern: string]: RateLimitRule;
+}
+
+/**
+ * Function to extract a unique key for rate limiting from a request.
+ * Default implementation uses IP address.
+ */
+export type KeyExtractor = (req: Request) => string;
+
+/**
+ * Configuration for the rate limiter middleware.
+ */
+export interface RateLimiterConfig {
+  /** Per-route rate limit rules */
+  routes: RouteRateLimitConfig;
+
+  /** Storage backend (defaults to in-memory) */
+  store?: RateLimitStore;
+
+  /** Custom key extraction function */
+  keyExtractor?: KeyExtractor;
+
+  /** Whether to include rate limit headers on successful (non-429) responses */
+  includeHeadersOnSuccess?: boolean;
+
+  /** Custom handler for rate-limited requests */
+  onRateLimited?: (req: Request, res: Response, result: RateLimitResult) => void;
+
+  /** Whether to skip failed requests (non-2xx responses) from counting */
+  skipFailedRequests?: boolean;
+
+  /** Whether to skip successful requests from counting */
+  skipSuccessfulRequests?: boolean;
+
+  /** Requests matching this function are exempt from rate limiting */
+  skip?: (req: Request) => boolean | Promise<boolean>;
+}
+
+/**
+ * The hit info returned by the store's atomic hit operation.
+ */
+export interface StoreHitResult {
+  /** Total number of requests currently in the sliding window after this hit */
+  totalHits: number;
+  /** Unix timestamp (ms) of the oldest request still in the window */
+  oldestRequestMs: number;
+  /** Unix timestamp (ms) of the current request */
+  currentRequestMs: number;
+}
+
+/**
+ * Abstract storage interface for the rate limiter.
+ * Implementations must ensure atomicity of the `hit` operation.
+ */
+export interface RateLimitStore {
+  /**
+   * Record a hit and return the current window state.
+   * This must be atomic — prune expired entries, add the new one, and count.
+   *
+   * @param key - Unique identifier (e.g., "ip:192.168.1.1:/api/login")
+   * @param windowMs - Sliding window duration in milliseconds
+   * @param now - Current timestamp in ms (injectable for testing)
+   * @returns Hit result with count and timing info
+   */
+  hit(key: string, windowMs: number, now?: number): Promise<StoreHitResult>;
+
+  /**
+   * Get current count without recording a hit.
+   */
+  peek(key: string, windowMs: number, now?: number): Promise<number>;
+
+  /**
+   * Reset all entries for a key.
+   */
+  reset(key: string): Promise<void>;
+
+  /**
+   * Graceful shutdown — clean up timers, connections, etc.
+   */
+  shutdown(): Promise<void>;
+}
+
+/**
+ * Options for the in-memory store.
+ */
+export interface MemoryStoreOptions {
+  /** How often to sweep expired entries, in ms. Default: 60000 (1 min) */
+  sweepIntervalMs?: number;
+}
+
+/**
+ * Options for the Redis store.
+ */
+export interface RedisStoreOptions {
+  /** ioredis client instance or compatible */
+  client: RedisClient;
+  /** Key prefix in Redis. Default: "rl:" */
+  prefix?: string;
+}
+
+/**
+ * Minimal Redis client interface (compatible with ioredis).
+ * We only need these methods, keeping the dependency light.
+ */
+export interface RedisClient {
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
+  del(key: string): Promise<number>;
+  zcard(key: string): Promise<number>;
+  zrangebyscore(
+    key: string,
+    min: number | string,
+    max: number | string
+  ): Promise<string[]>;
+  quit(): Promise<string>;
+}
+```
+
+### store.interface.ts
+
+```typescript
+// src/stores/store.interface.ts
+// Re-exports for clean imports
+export type { RateLimitStore, StoreHitResult } from '../types';
+```
+
+### memory.store.ts
+
+```typescript
+// src/stores/memory.store.ts
+
+import { RateLimitStore, StoreHitResult, MemoryStoreOptions } from '../types';
+
+/**
+ * In-memory sliding window log store.
+ *
+ * Each key maps to a sorted array of timestamps (ms).
+ * Periodic sweeping removes stale keys to prevent memory leaks.
+ *
+ * Thread-safe in Node.js single-threaded context.
+ * NOT suitable for multi-process deployments without sticky sessions.
+ */
+export class MemoryStore implements RateLimitStore {
+  private store: Map<string, number[]> = new Map();
+  private sweepInterval: ReturnType<typeof setInterval> | null = null;
+  private maxWindowMs: number = 0; // Track largest window for sweeping
+
+  constructor(private options: MemoryStoreOptions = {}) {
+    const sweepMs = options.sweepIntervalMs ?? 60_000;
+    if (sweepMs > 0) {
+      this.sweepInterval = setInterval(() => this.sweep(), sweepMs);
+      // Don't prevent Node.js from exiting
+      if (this.sweepInterval.unref) {
+        this.sweepInterval.unref();
+      }
+    }
+  }
+
+  async hit(key: string, windowMs: number, now?: number): Promise<StoreHitResult> {
+    const currentTime = now ?? Date.now();
+    const windowStart = currentTime - windowMs;
+
+    // Track max window for sweep efficiency
+    if (windowMs > this.maxWindowMs) {
+      this.maxWindowMs = windowMs;
+    }
+
+    let timestamps = this.store.get(key);
+
+    if (!timestamps) {
+      timestamps = [];
+      this.store.set(key, timestamps);
+    }
+
+    // Prune expired entries (timestamps is sorted, so find cutoff index)
+    const cutoffIndex = this.binarySearchCutoff(timestamps, windowStart);
+    if (cutoffIndex > 0) {
+      timestamps.splice(0, cutoffIndex);
+    }
+
+    // Add current request
+    timestamps.push(currentTime);
+
+    const oldestRequestMs = timestamps.length > 0 ? timestamps[0] : currentTime;
+
+    return {
+      totalHits: timestamps.length,
+      oldestRequestMs,
+      currentRequestMs: currentTime,
+    };
+  }
+
+  async peek(key: string, windowMs: number, now?: number): Promise<number> {
+    const currentTime = now ?? Date.now();
+    const windowStart = currentTime - windowMs;
+    const timestamps = this.store.get(key);
+
+    if (!timestamps) return 0;
+
+    const cutoffIndex = this.binarySearchCutoff(timestamps, windowStart);
+    return timestamps.length - cutoffIndex;
+  }
+
+  async reset(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.sweepInterval) {
+      clearInterval(this.sweepInterval);
+      this.sweepInterval = null;
+    }
+    this.store.clear();
+  }
+
+  /**
+   * Binary search to find the index of the first element > windowStart.
+   * All elements before this index are expired and should be pruned.
+   */
+  private binarySearchCutoff(timestamps: number[], windowStart: number): number {
+    let low = 0;
+    let high = timestamps.length;
+
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (timestamps[mid] <= windowStart) {
+        low = mid + 1;
+      } else {
+        high = mid;

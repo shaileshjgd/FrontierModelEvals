@@ -1,0 +1,243 @@
+Creating a production-ready sliding window rate limiter in Express.js with TypeScript involves several steps. Below is a complete solution, including middleware implementation with both in-memory and Redis storage options, TypeScript typings, and basic unit tests using Jest.
+
+### Project Setup
+
+Ensure you have the necessary packages installed:
+
+```bash
+npm init -y
+npm install express ioredis typescript @types/express @types/node jest @types/jest ts-jest ts-node --save-dev
+```
+
+### Directory Structure
+
+Organize your project as follows:
+
+```
+/src
+  index.ts
+  rateLimiter.ts
+  rateLimiter.test.ts
+/tsconfig.json
+/jest.config.js
+```
+
+### tsconfig.json
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES6",
+    "module": "commonjs",
+    "outDir": "./dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "**/*.spec.ts"]
+}
+```
+
+### jest.config.js
+
+```js
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  testMatch: ['**/*.test.ts']
+};
+```
+
+### rateLimiter.ts
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import Redis from 'ioredis';
+
+type RateLimitOptions = {
+  windowSize: number; // in milliseconds
+  maxRequests: number; // maximum requests within the window
+  message?: string;
+  redisClient?: Redis.Redis;
+};
+
+type RateLimitConfig = Record<string, RateLimitOptions>;
+
+class RateLimiter {
+  private config: RateLimitConfig;
+  private memoryStore: Map<string, number[]> = new Map();
+
+  constructor(config: RateLimitConfig) {
+    this.config = config;
+  }
+
+  private async getTokens(
+    key: string,
+    currentTimestamp: number,
+    windowSize: number,
+    redisClient?: Redis.Redis
+  ): Promise<number[]> {
+    if (redisClient) {
+      const tokensString = await redisClient.get(key);
+      return tokensString ? JSON.parse(tokensString) : [];
+    }
+
+    const tokens = this.memoryStore.get(key) || [];
+    return tokens.filter((timestamp) => currentTimestamp - timestamp < windowSize);
+  }
+
+  private async saveTokens(
+    key: string,
+    newTokens: number[],
+    redisClient?: Redis.Redis
+  ): Promise<void> {
+    if (redisClient) {
+      await redisClient.set(key, JSON.stringify(newTokens), 'PX', 3600000);
+    } else {
+      this.memoryStore.set(key, newTokens);
+    }
+  }
+
+  public getMiddleware() {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      const route = req.baseUrl + req.path;
+      const options = this.config[route];
+  
+      if (!options) {
+        return next();
+      }
+  
+      const { windowSize, maxRequests, message = 'Too many requests', redisClient } = options;
+      const currentTimestamp = Date.now();
+      const key = `rate:${route}:${req.ip}`;
+  
+      const tokens = await this.getTokens(key, currentTimestamp, windowSize, redisClient);
+  
+      if (tokens.length >= maxRequests) {
+        const reset = Math.ceil((windowSize - (currentTimestamp - tokens[0])) / 1000);
+        res.setHeader('Retry-After', reset.toString());
+        res.setHeader('X-RateLimit-Limit', maxRequests.toString());
+        res.setHeader('X-RateLimit-Remaining', '0');
+        res.setHeader('X-RateLimit-Reset', reset.toString());
+        return res.status(429).send(message);
+      }
+  
+      tokens.push(currentTimestamp);
+      await this.saveTokens(key, tokens, redisClient);
+  
+      res.setHeader('X-RateLimit-Limit', maxRequests.toString());
+      res.setHeader('X-RateLimit-Remaining', (maxRequests - tokens.length).toString());
+      res.setHeader('X-RateLimit-Reset', Math.ceil((windowSize - (currentTimestamp - tokens[0])) / 1000).toString());
+  
+      next();
+    };
+  }
+}
+
+export default RateLimiter;
+```
+
+### index.ts
+
+```typescript
+import express from 'express';
+import RateLimiter from './rateLimiter';
+import Redis from 'ioredis';
+
+const app = express();
+const redisClient = new Redis();
+
+const rateLimiter = new RateLimiter({
+  '/api/some-route': {
+    windowSize: 60000, // 60 seconds
+    maxRequests: 5,
+    redisClient // comment this line to use in-memory storage
+  },
+  '/api/another-route': {
+    windowSize: 60000,
+    maxRequests: 10
+  }
+});
+
+app.use('/api/some-route', rateLimiter.getMiddleware());
+app.use('/api/another-route', rateLimiter.getMiddleware());
+
+app.get('/api/some-route', (req, res) => {
+  res.send('This is some-route.');
+});
+
+app.get('/api/another-route', (req, res) => {
+  res.send('This is another-route.');
+});
+
+app.listen(3000, () => {
+  console.log('Server is running on port 3000');
+});
+```
+
+### rateLimiter.test.ts
+
+```typescript
+import request from 'supertest';
+import express from 'express';
+import RateLimiter from './rateLimiter';
+
+describe('RateLimiter Middleware', () => {
+  let app: express.Application;
+
+  beforeEach(() => {
+    app = express();
+
+    const rateLimiter = new RateLimiter({
+      '/test': {
+        windowSize: 1000,
+        maxRequests: 2
+      }
+    });
+
+    app.use('/test', rateLimiter.getMiddleware());
+
+    app.get('/test', (req, res) => {
+      res.send('OK');
+    });
+  });
+
+  it('should allow requests under the rate limit', async () => {
+    const response1 = await request(app).get('/test');
+    expect(response1.status).toBe(200);
+    
+    const response2 = await request(app).get('/test');
+    expect(response2.status).toBe(200);
+  });
+
+  it('should block requests exceeding the rate limit', async () => {
+    await request(app).get('/test');
+    await request(app).get('/test');
+
+    const response = await request(app).get('/test');
+    expect(response.status).toBe(429);
+    expect(response.headers['x-ratelimit-limit']).toBe('2');
+    expect(response.headers['x-ratelimit-remaining']).toBe('0');
+  });
+});
+```
+
+### Running Tests
+
+To run the tests, add the following script in `package.json`:
+
+```json
+"scripts": {
+  "test": "jest"
+}
+```
+
+Now you can execute the tests:
+
+```bash
+npm test
+```
+
+This setup allows for easy integration of additional routes and configurations per route. The in-memory storage can be swapped for Redis by passing a Redis client instance into the options, making it suitable for distributed deployments. This is a robust and scalable solution for rate limiting in production environments using Express.js.
+ELAPSED_MS:16288
